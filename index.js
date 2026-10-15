@@ -14,6 +14,7 @@ import {
   REST,
   Routes,
   SlashCommandBuilder,
+  EmbedBuilder,
   ActionRowBuilder,
   StringSelectMenuBuilder,
   ButtonBuilder,
@@ -29,14 +30,14 @@ import { createServer } from "http";
 const POSITIONS        = ["CF", "RW", "LW", "CM", "GK"];
 const TEAMS            = ["HOME", "AWAY"];
 const RARITY_CHARACTERS = {
- RARE:        ["Isagi", "kurona", "Gagamaru", "Chigiri", "Raichi"],
+ RARE:        ["Isagi", "kurona", "Gagamaru", "Chigiri", "Raichi", "Igaguri"],
   EPIC:        ["Otoya", "Hirori", "Bachira", "Karasu"],
   LEGENDARY:   ["Kunigami", "Kiyora", "Aiku", "Nagi", "King"],
   MYTHIC:      ["Shidou", "Reo", "Niko", "Rin", "Charles", "Yukimiya", "Ness"],
   WORLDCLASS:  ["Sae", "Don Lorenzo", "Kaiser"],
   MASTERCLASS: ["Loki", "Lavinho"],
   LIMITEDS: [
-    "Elf Emperor", "Easter Yukimiya", "Reaper Sae", "Skeleton Nagi",
+    "Elf Emperor", "Easter Yukimiya", "Reaper Sae", "Bloodmoon Rin", "Skeleton Nagi",
     "Phantom Isagi", "Demon Shidou", "Firework Bachira",
     "Subzero Loki", "Krampus Barou",
   ],
@@ -89,8 +90,7 @@ function raritySelect(prefix, sessionId, position) {
   );
 }
 
-function charSelect(prefix, sessionId, position, rarity) {
-  const chars = RARITY_CHARACTERS[rarity] ?? [];
+function charSelect(prefix, sessionId, position, rarity, chars = RARITY_CHARACTERS[rarity] ?? []) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(`${prefix}_char:${sessionId}:${position}`)
@@ -303,18 +303,49 @@ function buildTeamContent(session, title) {
   const lines = [`# ${title}`, ""];
   for (const team of TEAMS) {
     lines.push(`# ${team}`);
-    for (const pos of POSITIONS) {
+    for (const pos of ["CF", "LW", "RW", "CM", "GK"]) {
       const e = session.teams[team][pos];
-      if (e) {
-        const char = e.character ? ` (${e.character})` : " (Choosing character...)";
-        lines.push(`**${pos}:** <@${e.userId}>${char}`);
-      } else {
-        lines.push(`**${pos}:**`);
-      }
+      const player = e
+        ? ` <@${e.userId}>${e.character ? ` (${e.character})` : " (Choosing character...)"}`
+        : "";
+      lines.push(`> **${pos} :**${player}`);
     }
     lines.push("");
   }
   return lines.join("\n");
+}
+
+function buildInhouseEmbed(session, ended = false) {
+  const teamField = (team) => {
+    const players = ["CF", "LW", "RW", "CM", "GK"];
+    const filled = players.filter((pos) => session.teams[team][pos] !== null).length;
+    const lines = players.map((pos) => {
+      const e = session.teams[team][pos];
+      const player = e
+        ? `<@${e.userId}>${e.character ? `  ·  **${e.character}**` : "  ·  *Choosing character...*"}`
+        : "*— Vacant —*";
+      return `\`${pos}\`  ${player}`;
+    });
+
+    return {
+      name: `${team === "HOME" ? "🔵" : "🟣"}  ${team}  ·  ${filled}/5 PLAYERS`,
+      value: lines.join("\n"),
+      inline: true
+    };
+  };
+
+  return new EmbedBuilder()
+    .setColor(ended ? 0x747b8b : 0x3478f6)
+    .setAuthor({ name: "RENO  •  SCRIM SYSTEM" })
+    .setTitle(ended ? "INHOUSE  ·  ENDED" : "⚔️  INHOUSE MATCHMAKING")
+    .setDescription(
+      ended
+        ? "This in-house session has ended."
+        : "Choose your position from the menu below.\n━━━━━━━━━━━━━━━━━━━━"
+    )
+    .addFields(teamField("HOME"), teamField("AWAY"))
+    .setFooter({ text: "Reno Scrim System  •  Play fair, play together" })
+    .setTimestamp();
 }
 
 function buildTeamComponents(prefix, sessionId) {
@@ -326,8 +357,7 @@ function buildTeamComponents(prefix, sessionId) {
   );
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`${prefix}_changechar:${sessionId}`).setLabel("تغيير الشخصية").setEmoji("🔄").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`${prefix}_leave:${sessionId}`).setLabel("Leave Position").setEmoji("🚪").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${prefix}_kick:${sessionId}`).setLabel("Kick Player").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(`${prefix}_leave:${sessionId}`).setLabel("Leave Position").setEmoji("🚪").setStyle(ButtonStyle.Secondary)
   );
   return [posSelect, buttons];
 }
@@ -377,8 +407,28 @@ async function teamPosition(interaction, store, editFn, title, prefix) {
 async function teamRarity(interaction, store, prefix) {
   const [, sessionId, position] = interaction.customId.split(":");
   const rarity = interaction.values[0];
-  if (!store.get(sessionId)) return interaction.update({ content: "❌ الجلسة لم تعد موجودة.", components: [] });
-  await interaction.update({ content: `فئة **${rarity}** — اختر شخصيتك:`, components: [charSelect(prefix, sessionId, position, rarity)] });
+  const session = store.get(sessionId);
+  if (!session) return interaction.update({ content: "❌ الجلسة لم تعد موجودة.", components: [] });
+  const found = findPlayerInTeams(session, interaction.user.id);
+  if (!found || found.position !== position)
+    return interaction.update({ content: "❌ هذا المركز ليس لك!", components: [] });
+
+  const availableChars = (RARITY_CHARACTERS[rarity] ?? []).filter((character) =>
+    !POSITIONS.some((pos) =>
+      pos !== position &&
+      session.teams[found.team][pos]?.character?.toLowerCase() === character.toLowerCase()
+    )
+  );
+  if (!availableChars.length)
+    return interaction.update({
+      content: `❌ كل شخصيات فئة **${rarity}** مستخدمة بالفعل في فريق **${found.team}**. اختر فئة أخرى:`,
+      components: [raritySelect(prefix, sessionId, position)],
+    });
+
+  await interaction.update({
+    content: `فئة **${rarity}** — اختر شخصيتك:`,
+    components: [charSelect(prefix, sessionId, position, rarity, availableChars)],
+  });
 }
 
 async function teamChar(interaction, store, editFn, title, prefix) {
@@ -388,6 +438,15 @@ async function teamChar(interaction, store, editFn, title, prefix) {
   const found = findPlayerInTeams(session, interaction.user.id);
   if (!found || found.position !== position) return interaction.update({ content: "❌ هذا المركز ليس لك!", components: [] });
   const character = interaction.values[0];
+  const alreadyTaken = POSITIONS.some((pos) =>
+    pos !== position &&
+    session.teams[found.team][pos]?.character?.toLowerCase() === character.toLowerCase()
+  );
+  if (alreadyTaken)
+    return interaction.update({
+      content: `❌ الشخصية **${character}** مستخدمة بالفعل في فريق **${found.team}**. اختر شخصية أخرى:`,
+      components: [raritySelect(prefix, sessionId, position)],
+    });
   session.teams[found.team][position].character = character;
   await interaction.update({ content: `✅ اخترت **${character}** في **${found.team} - ${position}**!`, components: [] });
   await editFn(sessionId, session, interaction.client);
@@ -451,7 +510,7 @@ async function editInhouseMessage(sessionId, session, client) {
     const ch = await client.channels.fetch(session.channelId);
     if (ch?.isTextBased()) {
       const msg = await ch.messages.fetch(sessionId);
-      await msg.edit({ content: buildTeamContent(session, "IN-HOUSE!"), embeds: [], components: buildTeamComponents("inhouse", sessionId) });
+      await msg.edit({ content: null, embeds: [buildInhouseEmbed(session)], components: buildTeamComponents("inhouse", sessionId) });
     }
   } catch { }
 }
@@ -466,7 +525,7 @@ async function expireInhouse(sessionId, client) {
     const ch = await client.channels.fetch(s.channelId);
     if (ch?.isTextBased()) {
       const msg = await ch.messages.fetch(sessionId);
-      await msg.edit({ content: msg.content + "\n\n**In-house has ended**", components: [] });
+      await msg.edit({ content: null, embeds: [buildInhouseEmbed(s, true)], components: [] });
     }
   } catch { }
 }
@@ -497,7 +556,7 @@ async function handleInhouseCommand(interaction) {
   if (existingId) await expireInhouse(existingId, interaction.client);
   channelInhouse.set(interaction.channelId, messageId);
 
-  await interaction.editReply({ content: buildTeamContent(session, "IN-HOUSE!"), embeds: [], components: buildTeamComponents("inhouse", messageId) });
+  await interaction.editReply({ content: null, embeds: [buildInhouseEmbed(session)], components: buildTeamComponents("inhouse", messageId) });
 }
 
 async function handleInhouseInteraction(interaction) {
